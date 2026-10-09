@@ -14,6 +14,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -66,11 +67,27 @@ type config struct {
 	historyDepth int
 }
 
-// Token authenticates with a bearer-style access token (sent as HTTP basic auth
-// with user "x-access-token", which GitHub, GitLab and Gitea all accept).
+// Token authenticates with an access token over HTTP basic auth, using the
+// username each host expects alongside a token: "x-token-auth" on bitbucket.org
+// (repository/workspace access tokens), "x-access-token" on github.com and
+// GitHub Enterprise Cloud (*.ghe.com), and "oauth2" elsewhere, which GitLab
+// (gitlab.com and self-hosted), Gitea and GitHub Enterprise Server accept.
+// Use BasicAuth to choose the username yourself (e.g. Bitbucket app passwords).
 func Token(token string) Option {
 	return func(c *config) {
-		c.auth = func(r *http.Request) { r.SetBasicAuth("x-access-token", token) }
+		c.auth = func(r *http.Request) { r.SetBasicAuth(tokenUser(r.URL.Hostname()), token) }
+	}
+}
+
+func tokenUser(host string) string {
+	host = strings.ToLower(host)
+	switch {
+	case host == "bitbucket.org":
+		return "x-token-auth"
+	case host == "github.com" || strings.HasSuffix(host, ".ghe.com"):
+		return "x-access-token"
+	default:
+		return "oauth2"
 	}
 }
 
