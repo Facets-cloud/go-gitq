@@ -30,13 +30,11 @@ func cleanPath(p string) string {
 	return p
 }
 
-// rootOf resolves ref and returns the commit hash, the commit, and ensures its trees are cached.
+// rootOf resolves ref and returns the commit hash and the commit. Fetching a
+// commit brings all its trees in the same request.
 func (r *repo) rootOf(ctx context.Context, ref string) (object.Hash, *object.Commit, error) {
 	h, err := r.resolve(ctx, ref)
 	if err != nil {
-		return h, nil, err
-	}
-	if err := r.ensureCommit(ctx, h); err != nil {
 		return h, nil, err
 	}
 	c, err := r.commit(ctx, h)
@@ -84,8 +82,8 @@ func (r *repo) fetchBlobs(ctx context.Context, hashes []object.Hash) (map[object
 		if _, ok := out[h]; ok {
 			continue
 		}
-		if d, ok := r.blobs.get(h); ok {
-			out[h] = d
+		if o, ok := r.objs.get(h); ok && o.Type == object.TypeBlob {
+			out[h] = o.Data
 			continue
 		}
 		out[h] = nil
