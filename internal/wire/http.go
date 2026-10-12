@@ -34,7 +34,9 @@ func (c *Client) do(ctx context.Context, method, path string, body []byte, hdr m
 		req.Header.Set(k, v)
 	}
 	if c.Auth != nil {
-		c.Auth(req)
+		if err := c.Auth(req); err != nil {
+			return nil, fmt.Errorf("%w: %w", ErrAuth, err)
+		}
 	}
 	resp, err := c.httpClient().Do(req)
 	if err != nil {

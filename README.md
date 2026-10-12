@@ -28,10 +28,16 @@ newSHA, err := repo.Save(ctx, "main", sha, "update config", gitq.Author{Name: "B
 if errors.Is(err, gitq.ErrConflict) { /* branch moved; re-read and retry */ }
 ```
 
-The cache is required. It holds file contents compressed (source code shrinks
-3-5x) within the byte budget you give it, evicting least recently used files.
-Contents are keyed by hash, so one cache shared by all repos is safe and dedupes
-identical files. `cache.Stats()` reports usage.
+The cache is required, and it is the only place fetched data lives: file
+contents, directory listings and commits all share the byte budget you give it,
+and the least recently used are evicted (and fetched again if needed). File
+contents can be stored compressed (source code shrinks 3-5x). Objects are keyed
+by hash, so one cache shared by all repos is safe and dedupes identical files.
+`cache.Stats()` reports usage. Size it to hold at least the directory listings
+of your largest repo at one commit (a few MB for hashicorp/terraform).
+
+`GetHistory` returns what `git log -n limit ref -- path` returns, including
+across merges.
 
 A `ref` is a branch, tag or full commit SHA. `File.SHA` changes only when that
 file's content changes, so callers can skip unchanged files cheaply.
@@ -41,7 +47,14 @@ file's content changes, so callers can skip unchanged files cheaply.
 - HTTPS only. `git@host:owner/repo` URLs are accepted and rewritten to HTTPS.
 - The server must support protocol v2 with partial-clone filters (GitHub, GitLab,
   Gitea/Forgejo do). Others fail `Open` with `ErrUnsupported`.
-- Auth: `gitq.Token(tok)` or `gitq.BasicAuth(user, pass)`.
+- Auth: `gitq.Token(tok)`, `gitq.BasicAuth(user, pass)`, or
+  `gitq.AuthFunc(func(*http.Request) error)`, called on every request, for
+  tokens that rotate (GitHub App installation tokens).
+- Memory: `gitq.MaxFileSize(n)` (default 100 MiB) and `gitq.MaxFetchSize(n)`
+  (default 512 MiB) bound what a server can make gitq allocate. Packs are
+  decoded as they stream in; sizes are checked before allocating, and exceeding
+  a limit fails with `ErrTooLarge`.
+- Go 1.24 or later.
 - Not supported: SSH, LFS content, submodule contents, merges, signed commits.
 
 ## Layout
@@ -58,10 +71,21 @@ examples/terraform    timed walkthrough against hashicorp/terraform
 ## Try it
 
 ```
-go test -short ./...                         # offline tests (needs the git binary)
+go test -short -race ./...                   # offline tests (needs the git binary)
 go test ./...                                # plus live tests against GitHub
+go test ./internal/pack -run '^$' -fuzz FuzzDecode -fuzztime 60s
 go run ./examples/terraform -compare         # timings vs the git CLI
+go run ./examples/hostcheck <repo-url>...    # every read call against any host
 GITQ_LIVE=1 go test -run '^$' -bench . -benchtime 5x
+```
+
+Live tests with credentials run per host when its variables are set
+(`HOST` is `GITHUB`, `GHE`, `GITLAB`, `GITLAB_SELF` or `BITBUCKET`):
+
+```
+GITQ_TEST_<HOST>_URL=https://...  GITQ_TEST_<HOST>_TOKEN=...  [GITQ_TEST_<HOST>_USER=...]
+GITQ_TEST_WRITE=1   # also Save to a throwaway branch, then delete it
+go test -run TestLiveHosts -v .
 ```
 
 ## License

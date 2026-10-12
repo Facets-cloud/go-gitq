@@ -115,7 +115,8 @@ func main() {
 	tw.Flush()
 
 	st := cache.Stats()
-	fmt.Printf("\ncache: %d files in %d KB (%d KB uncompressed)\n", st.Files, st.StoredBytes>>10, st.FileBytes>>10)
+	fmt.Printf("\ncache: %d KB holding %d files (%d KB uncompressed), %d trees, %d commits\n",
+		st.StoredBytes>>10, st.Files, st.FileBytes>>10, st.Trees, st.Commits)
 
 	if *compare {
 		fmt.Println()

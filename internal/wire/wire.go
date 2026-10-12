@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 
 	"github.com/facets-cloud/go-gitq/internal/object"
@@ -17,6 +18,7 @@ var (
 	ErrUnsupported = errors.New("wire: server does not support protocol v2 with filter")
 	ErrStale       = errors.New("wire: ref moved since expected old value")
 	ErrRateLimited = errors.New("wire: rate limited")
+	ErrTooLarge    = errors.New("wire: response exceeds size limit")
 )
 
 // RejectedError is a push rejected by the server for a reason other than a stale
@@ -28,14 +30,15 @@ func (e *RejectedError) Error() string {
 }
 
 // Client talks to one repository. URL is the https repository URL ending in
-// ".git" (the caller normalises it). Auth, if set, decorates every request.
+// ".git" (the caller normalises it). Auth, if set, is called on every request
+// to add credentials; an error from it aborts that request.
 type Client struct {
 	URL  string
 	HTTP *http.Client
-	Auth func(*http.Request)
+	Auth func(*http.Request) error
 }
 
-func NewClient(url string, httpc *http.Client, auth func(*http.Request)) *Client {
+func NewClient(url string, httpc *http.Client, auth func(*http.Request) error) *Client {
 	if httpc == nil {
 		httpc = http.DefaultClient
 	}
@@ -83,11 +86,23 @@ type FetchRequest struct {
 	Filter string // e.g. "blob:none", "tree:0"; "" = no filter
 }
 
-// Fetch runs the v2 fetch command (sending "done", no negotiation rounds) and
-// returns the raw packfile bytes, de-sidebanded. shallow-info / acknowledgments
-// sections are skipped. Sideband channel 3 becomes an error.
+// FetchStream runs the v2 fetch command (sending "done", no negotiation rounds)
+// and returns the packfile as a stream, de-sidebanded. shallow-info and
+// acknowledgments sections are skipped. Sideband channel 3 becomes a read error.
+// Reading more than maxBytes of pack data (0 = no limit) fails with ErrTooLarge.
+// The caller must Close the stream.
+func (c *Client) FetchStream(ctx context.Context, req FetchRequest, maxBytes int64) (io.ReadCloser, error) {
+	return c.fetchStream(ctx, req, maxBytes)
+}
+
+// Fetch is FetchStream read to the end, with no size limit.
 func (c *Client) Fetch(ctx context.Context, req FetchRequest) ([]byte, error) {
-	return c.fetch(ctx, req)
+	rc, err := c.fetchStream(ctx, req, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer rc.Close()
+	return io.ReadAll(rc)
 }
 
 type RefUpdate struct {

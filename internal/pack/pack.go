@@ -36,11 +36,43 @@ type entry struct {
 	hash     object.Hash
 }
 
+// Limits bounds the memory a pack from an untrusted server can make Decode
+// allocate. Zero fields mean no limit.
+type Limits struct {
+	// MaxObject is the largest object (or delta) size accepted, checked against
+	// the size declared in the pack before anything is allocated.
+	MaxObject int64
+	// MaxTotal caps the sum of all inflated objects and delta results.
+	MaxTotal int64
+}
+
+// ErrTooLarge is returned when a pack exceeds Limits.
+var ErrTooLarge = errors.New("pack: exceeds size limit")
+
 // Decode reads a complete packfile ("PACK" header .. trailing checksum) and
 // returns every object fully resolved (OFS_DELTA and REF_DELTA applied), keyed by id.
 // The trailing checksum is verified.
 func Decode(r io.Reader, lookup Lookup) (map[object.Hash]object.Object, error) {
+	return DecodeLimited(r, lookup, Limits{})
+}
+
+// DecodeLimited is Decode with size limits.
+func DecodeLimited(r io.Reader, lookup Lookup, lim Limits) (map[object.Hash]object.Object, error) {
 	pr := newPackReader(r)
+	var total int64
+	charge := func(n uint64) error {
+		if n > 1<<40 {
+			return fmt.Errorf("%w: object of %d bytes", ErrTooLarge, n)
+		}
+		if lim.MaxObject > 0 && n > uint64(lim.MaxObject) {
+			return fmt.Errorf("%w: object of %d bytes, limit %d", ErrTooLarge, n, lim.MaxObject)
+		}
+		total += int64(n)
+		if lim.MaxTotal > 0 && total > lim.MaxTotal {
+			return fmt.Errorf("%w: more than %d bytes of objects", ErrTooLarge, lim.MaxTotal)
+		}
+		return nil
+	}
 
 	var hdr [12]byte
 	if _, err := io.ReadFull(pr, hdr[:]); err != nil {
@@ -54,11 +86,14 @@ func Decode(r io.Reader, lookup Lookup) (map[object.Hash]object.Object, error) {
 	}
 	count := binary.BigEndian.Uint32(hdr[8:12])
 
-	entries := make([]entry, count)
-	byOffset := make(map[int64]int, count)
+	// count comes from the server: grow towards it rather than trusting it.
+	hint := int(min(count, 1<<14))
+	entries := make([]entry, 0, hint)
+	byOffset := make(map[int64]int, hint)
 	var zr io.ReadCloser
 
-	for i := range entries {
+	for i := 0; i < int(count); i++ {
+		entries = append(entries, entry{})
 		e := &entries[i]
 		e.offset = pr.offset()
 		byOffset[e.offset] = i
@@ -118,6 +153,9 @@ func Decode(r io.Reader, lookup Lookup) (map[object.Hash]object.Object, error) {
 		if err != nil {
 			return nil, fmt.Errorf("pack: object %d zlib: %w", i, err)
 		}
+		if err := charge(size); err != nil {
+			return nil, fmt.Errorf("pack: object %d: %w", i, err)
+		}
 		data := make([]byte, size)
 		if _, err := io.ReadFull(zr, data); err != nil {
 			return nil, fmt.Errorf("pack: object %d inflate: %w", i, err)
@@ -174,7 +212,7 @@ func Decode(r io.Reader, lookup Lookup) (map[object.Hash]object.Object, error) {
 			if c.resolved {
 				continue
 			}
-			res, err := applyDelta(baseData, c.data)
+			res, err := applyDelta(baseData, c.data, charge)
 			if err != nil {
 				return fmt.Errorf("pack: delta at offset %d: %w", c.offset, err)
 			}
@@ -239,8 +277,9 @@ func Decode(r io.Reader, lookup Lookup) (map[object.Hash]object.Object, error) {
 	return out, nil
 }
 
-// applyDelta applies git delta instructions to base.
-func applyDelta(base, delta []byte) ([]byte, error) {
+// applyDelta applies git delta instructions to base. charge, if set, approves
+// the declared result size before it is allocated.
+func applyDelta(base, delta []byte, charge func(uint64) error) ([]byte, error) {
 	srcSize, delta, err := deltaVarint(delta)
 	if err != nil {
 		return nil, err
@@ -251,6 +290,11 @@ func applyDelta(base, delta []byte) ([]byte, error) {
 	dstSize, delta, err := deltaVarint(delta)
 	if err != nil {
 		return nil, err
+	}
+	if charge != nil {
+		if err := charge(dstSize); err != nil {
+			return nil, err
+		}
 	}
 	out := make([]byte, 0, dstSize)
 	for len(delta) > 0 {

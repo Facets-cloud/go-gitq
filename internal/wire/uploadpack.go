@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
 	"strconv"
 	"strings"
 )
@@ -105,7 +106,7 @@ func (c *Client) lsRefs(ctx context.Context, prefixes []string) ([]Ref, error) {
 	}
 }
 
-func (c *Client) fetch(ctx context.Context, req FetchRequest) ([]byte, error) {
+func (c *Client) fetchStream(ctx context.Context, req FetchRequest, maxBytes int64) (io.ReadCloser, error) {
 	if len(req.Wants) == 0 {
 		return nil, fmt.Errorf("wire: fetch with no wants")
 	}
@@ -133,26 +134,29 @@ func (c *Client) fetch(ctx context.Context, req FetchRequest) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer closeBody(resp)
 	pr := newPktReader(resp.Body)
 
 	// Section headers, skipping everything until "packfile".
 	for {
 		k, line, err := pr.nextLine()
 		if err != nil {
+			closeBody(resp)
 			return nil, unexpected(err)
 		}
 		if k != pktData {
+			closeBody(resp)
 			return nil, fmt.Errorf("wire: fetch response ended without packfile")
 		}
 		switch line {
 		case "packfile":
-			return readSideband(pr, resp.ContentLength)
+			return &sidebandReader{pr: pr, resp: resp, max: maxBytes, left: maxBytes}, nil
 		case "acknowledgments", "shallow-info", "wanted-refs":
 			if err := skipSection(pr); err != nil {
+				closeBody(resp)
 				return nil, err
 			}
 		default:
+			closeBody(resp)
 			return nil, fmt.Errorf("wire: unexpected fetch section %q", line)
 		}
 	}
@@ -174,36 +178,61 @@ func skipSection(pr *pktReader) error {
 	}
 }
 
-// readSideband collects channel-1 data until flush.
-func readSideband(pr *pktReader, sizeHint int64) ([]byte, error) {
-	var out bytes.Buffer
-	if sizeHint > 0 && sizeHint < 1<<31 {
-		out.Grow(int(sizeHint))
-	} else {
-		out.Grow(64 << 10)
+// sidebandReader streams channel-1 data of the packfile section until flush.
+type sidebandReader struct {
+	pr   *pktReader
+	resp *http.Response
+	cur  []byte // unread channel-1 payload (aliases pr's buffer)
+	max  int64  // pack size limit; 0 = none
+	left int64  // bytes still allowed under max
+	err  error
+}
+
+func (s *sidebandReader) Read(p []byte) (int, error) {
+	for len(s.cur) == 0 {
+		if s.err != nil {
+			return 0, s.err
+		}
+		s.err = s.advance()
 	}
-	for {
-		k, b, err := pr.next()
-		if err != nil {
-			return nil, fmt.Errorf("wire: reading pack: %w", unexpected(err))
-		}
-		if k != pktData {
-			return out.Bytes(), nil
-		}
-		if len(b) == 0 {
-			continue
-		}
-		switch b[0] {
-		case 1:
-			out.Write(b[1:])
-		case 2:
-		case 3:
-			return nil, &remoteError{strings.TrimSpace(string(b[1:]))}
-		default:
-			if bytes.HasPrefix(b, []byte("ERR ")) {
-				return nil, &remoteError{strings.TrimSpace(string(b[4:]))}
+	n := copy(p, s.cur)
+	s.cur = s.cur[n:]
+	return n, nil
+}
+
+func (s *sidebandReader) advance() error {
+	k, b, err := s.pr.next()
+	if err != nil {
+		return fmt.Errorf("wire: reading pack: %w", unexpected(err))
+	}
+	if k != pktData {
+		return io.EOF
+	}
+	if len(b) == 0 {
+		return nil
+	}
+	switch b[0] {
+	case 1:
+		if s.max > 0 {
+			if int64(len(b)-1) > s.left {
+				return fmt.Errorf("%w: pack larger than %d bytes", ErrTooLarge, s.max)
 			}
-			return nil, fmt.Errorf("wire: bad sideband channel %d", b[0])
+			s.left -= int64(len(b) - 1)
 		}
+		s.cur = b[1:]
+		return nil
+	case 2:
+		return nil
+	case 3:
+		return &remoteError{strings.TrimSpace(string(b[1:]))}
 	}
+	if bytes.HasPrefix(b, []byte("ERR ")) {
+		return &remoteError{strings.TrimSpace(string(b[4:]))}
+	}
+	return fmt.Errorf("wire: bad sideband channel %d", b[0])
+}
+
+func (s *sidebandReader) Close() error {
+	closeBody(s.resp)
+	return nil
 }

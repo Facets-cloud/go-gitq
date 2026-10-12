@@ -1,7 +1,6 @@
 package gitq
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -22,12 +21,7 @@ type repo struct {
 	cfg config
 	wc  *wire.Client
 
-	mu       sync.RWMutex
-	objs     map[object.Hash]object.Object // commits and trees (raw)
-	trees    map[object.Hash][]object.TreeEntry
-	commits  map[object.Hash]*object.Commit
-	complete map[object.Hash]bool // trees whose whole subtree closure is cached
-	blobs    *blobLRU
+	objs *objLRU // shared, bounded; the only object store
 
 	refMu sync.Mutex
 	refs  map[string]refEntry
@@ -35,12 +29,15 @@ type repo struct {
 	sf flight
 }
 
+// maxRefEntries bounds the per-repo ref cache used with RefTTL.
+const maxRefEntries = 1024
+
 type refEntry struct {
 	hash object.Hash
 	exp  time.Time
 }
 
-func open(ctx context.Context, url string, cfg config, blobs *blobLRU) (*repo, error) {
+func open(ctx context.Context, url string, cfg config, objs *objLRU) (*repo, error) {
 	u, err := normalizeURL(url)
 	if err != nil {
 		return nil, err
@@ -53,14 +50,10 @@ func open(ctx context.Context, url string, cfg config, blobs *blobLRU) (*repo, e
 		hc = defaultHTTPClient()
 	}
 	r := &repo{
-		cfg:      cfg,
-		wc:       wire.NewClient(u, hc, cfg.auth),
-		objs:     make(map[object.Hash]object.Object),
-		trees:    make(map[object.Hash][]object.TreeEntry),
-		commits:  make(map[object.Hash]*object.Commit),
-		complete: make(map[object.Hash]bool),
-		blobs:    blobs,
-		refs:     make(map[string]refEntry),
+		cfg:  cfg,
+		wc:   wire.NewClient(u, hc, cfg.auth),
+		objs: objs,
+		refs: make(map[string]refEntry),
 	}
 	caps, err := r.wc.Capabilities(ctx)
 	if err != nil {
@@ -143,6 +136,8 @@ func mapErr(err error) error {
 		return fmt.Errorf("%w: %w", ErrUnsupported, err)
 	case errors.Is(err, wire.ErrStale):
 		return fmt.Errorf("%w: %w", ErrConflict, err)
+	case errors.Is(err, wire.ErrTooLarge), errors.Is(err, pack.ErrTooLarge):
+		return fmt.Errorf("%w: %w", ErrTooLarge, err)
 	}
 	return err
 }
@@ -152,235 +147,100 @@ func notFound(format string, args ...any) error {
 }
 
 // ---- object cache ----
+//
+// Every object lives in the shared objLRU and may be evicted at any time, so
+// each accessor falls back to fetching, and uses the objects a fetch returned
+// directly rather than re-reading the cache (which may already have dropped
+// them when the budget is smaller than the fetch).
 
 func isDir(mode uint32) bool { return mode&0o170000 == object.ModeDir }
 
-func (r *repo) lookup(h object.Hash) (object.Object, bool) {
-	r.mu.RLock()
-	o, ok := r.objs[h]
-	r.mu.RUnlock()
-	if ok {
-		return o, true
-	}
-	if d, ok := r.blobs.get(h); ok {
-		return object.Object{Type: object.TypeBlob, Data: d}, true
-	}
-	return object.Object{}, false
-}
+func (r *repo) lookup(h object.Hash) (object.Object, bool) { return r.objs.get(h) }
 
-// addObjects stores decoded objects: commits and trees permanently, blobs in the LRU.
 func (r *repo) addObjects(objs map[object.Hash]object.Object) {
-	r.mu.Lock()
 	for h, o := range objs {
-		if o.Type == object.TypeCommit || o.Type == object.TypeTree {
-			r.objs[h] = o
-		}
-	}
-	r.mu.Unlock()
-	for h, o := range objs {
-		if o.Type == object.TypeBlob {
-			r.blobs.put(h, o.Data)
-		}
+		r.objs.put(h, o)
 	}
 }
 
-// cachedTree returns parsed tree entries if the tree is cached. The slice is shared; do not modify.
-func (r *repo) cachedTree(h object.Hash) ([]object.TreeEntry, bool, error) {
-	r.mu.RLock()
-	es, ok := r.trees[h]
-	o, raw := r.objs[h]
-	r.mu.RUnlock()
-	if ok {
-		return es, true, nil
-	}
-	if !raw || o.Type != object.TypeTree {
-		return nil, false, nil
+func parseTree(h object.Hash, o object.Object) ([]object.TreeEntry, error) {
+	if o.Type != object.TypeTree {
+		return nil, fmt.Errorf("gitq: %s is not a tree", h)
 	}
 	es, err := object.ParseTree(o.Data)
 	if err != nil {
-		return nil, false, fmt.Errorf("gitq: tree %s: %w", h, err)
-	}
-	r.mu.Lock()
-	r.trees[h] = es
-	r.mu.Unlock()
-	return es, true, nil
-}
-
-// tree returns a tree, fetching it (with its subtrees) if not cached.
-func (r *repo) tree(ctx context.Context, h object.Hash) ([]object.TreeEntry, error) {
-	es, ok, err := r.cachedTree(h)
-	if err != nil || ok {
-		return es, err
-	}
-	if err := r.fetchTrees(ctx, []object.Hash{h}); err != nil {
-		return nil, err
-	}
-	es, ok, err = r.cachedTree(h)
-	if err != nil {
-		return nil, err
-	}
-	if !ok {
-		return nil, fmt.Errorf("gitq: server did not send tree %s", h)
+		return nil, fmt.Errorf("gitq: tree %s: %w", h, err)
 	}
 	return es, nil
 }
 
-func (r *repo) cachedCommit(h object.Hash) (*object.Commit, bool, error) {
-	r.mu.RLock()
-	c, ok := r.commits[h]
-	o, raw := r.objs[h]
-	r.mu.RUnlock()
-	if ok {
-		return c, true, nil
-	}
-	if !raw || o.Type != object.TypeCommit {
-		return nil, false, nil
+func parseCommit(h object.Hash, o object.Object) (*object.Commit, error) {
+	if o.Type != object.TypeCommit {
+		return nil, fmt.Errorf("gitq: %s is not a commit", h)
 	}
 	c, err := object.ParseCommit(o.Data)
 	if err != nil {
-		return nil, false, fmt.Errorf("gitq: commit %s: %w", h, err)
-	}
-	r.mu.Lock()
-	r.commits[h] = c
-	r.mu.Unlock()
-	return c, true, nil
-}
-
-// fetch runs one fetch and caches every object in the returned pack.
-func (r *repo) fetch(ctx context.Context, req wire.FetchRequest) (map[object.Hash]object.Object, error) {
-	data, err := r.wc.Fetch(ctx, req)
-	if err != nil {
-		return nil, mapErr(err)
-	}
-	objs, err := pack.Decode(bytes.NewReader(data), r.lookup)
-	if err != nil {
-		return nil, fmt.Errorf("gitq: decoding pack: %w", err)
-	}
-	r.addObjects(objs)
-	return objs, nil
-}
-
-func hashesKey(prefix string, hs []object.Hash) string {
-	var b strings.Builder
-	b.WriteString(prefix)
-	for _, h := range hs {
-		b.WriteByte(':')
-		b.WriteString(h.String())
-	}
-	return b.String()
-}
-
-func (r *repo) fetchTrees(ctx context.Context, hs []object.Hash) error {
-	_, err := r.sf.do(ctx, hashesKey("trees", hs), func() (any, error) {
-		return r.fetch(ctx, wire.FetchRequest{Wants: hs, Filter: "blob:none"})
-	})
-	return err
-}
-
-// commit returns a commit, fetching it (depth 1, with its trees) if not cached.
-func (r *repo) commit(ctx context.Context, h object.Hash) (*object.Commit, error) {
-	c, ok, err := r.cachedCommit(h)
-	if err != nil || ok {
-		return c, err
-	}
-	if err := r.ensureCommit(ctx, h); err != nil {
-		return nil, err
-	}
-	c, ok, err = r.cachedCommit(h)
-	if err != nil {
-		return nil, err
-	}
-	if !ok {
-		return nil, notFound("commit %s", h)
+		return nil, fmt.Errorf("gitq: commit %s: %w", h, err)
 	}
 	return c, nil
 }
 
-// missingTrees walks the tree closure of h using only the cache, marks complete
-// subtrees, and appends any trees not cached to missing.
-func (r *repo) missingTrees(h object.Hash, missing *[]object.Hash, seen map[object.Hash]bool) (bool, error) {
-	r.mu.RLock()
-	done := r.complete[h]
-	r.mu.RUnlock()
-	if done {
-		return true, nil
+// tree returns a tree's entries, fetching it (with all its subtrees) if not cached.
+func (r *repo) tree(ctx context.Context, h object.Hash) ([]object.TreeEntry, error) {
+	if o, ok := r.objs.get(h); ok {
+		return parseTree(h, o)
 	}
-	if seen[h] {
-		return false, nil // already reported in this walk
-	}
-	seen[h] = true
-	es, ok, err := r.cachedTree(h)
-	if err != nil {
-		return false, err
-	}
-	if !ok {
-		*missing = append(*missing, h)
-		return false, nil
-	}
-	all := true
-	for _, e := range es {
-		if !isDir(e.Mode) {
-			continue
-		}
-		ok, err := r.missingTrees(e.Hash, missing, seen)
-		if err != nil {
-			return false, err
-		}
-		all = all && ok
-	}
-	if all {
-		r.mu.Lock()
-		r.complete[h] = true
-		r.mu.Unlock()
-	}
-	return all, nil
-}
-
-// ensureCommit makes sure the commit and its full tree closure are cached.
-func (r *repo) ensureCommit(ctx context.Context, h object.Hash) error {
-	r.mu.RLock()
-	if c, ok := r.commits[h]; ok && r.complete[c.Tree] {
-		r.mu.RUnlock()
-		return nil
-	}
-	r.mu.RUnlock()
-	_, err := r.sf.do(ctx, "commit:"+h.String(), func() (any, error) {
-		return nil, r.ensureCommitSlow(ctx, h)
+	v, err := r.sf.do(ctx, "tree:"+h.String(), func() (any, error) {
+		return r.fetch(ctx, wire.FetchRequest{Wants: []object.Hash{h}, Filter: "blob:none"})
 	})
-	return err
+	if err != nil {
+		return nil, err
+	}
+	o, ok := v.(map[object.Hash]object.Object)[h]
+	if !ok {
+		return nil, fmt.Errorf("gitq: server did not send tree %s", h)
+	}
+	return parseTree(h, o)
 }
 
-func (r *repo) ensureCommitSlow(ctx context.Context, h object.Hash) error {
-	c, ok, err := r.cachedCommit(h)
+// commit returns a commit, fetching it (depth 1, with all its trees) if not cached.
+func (r *repo) commit(ctx context.Context, h object.Hash) (*object.Commit, error) {
+	if o, ok := r.objs.get(h); ok {
+		return parseCommit(h, o)
+	}
+	return r.fetchCommit(ctx, h, 1)
+}
+
+// fetchCommit fetches depth commits of history from h, with their trees, and
+// returns h itself.
+func (r *repo) fetchCommit(ctx context.Context, h object.Hash, depth int) (*object.Commit, error) {
+	v, err := r.sf.do(ctx, fmt.Sprintf("commit:%d:%s", depth, h), func() (any, error) {
+		return r.fetch(ctx, wire.FetchRequest{Wants: []object.Hash{h}, Depth: depth, Filter: "blob:none"})
+	})
 	if err != nil {
-		return err
+		return nil, err
 	}
+	o, ok := v.(map[object.Hash]object.Object)[h]
 	if !ok {
-		if _, err := r.fetch(ctx, wire.FetchRequest{Wants: []object.Hash{h}, Depth: 1, Filter: "blob:none"}); err != nil {
-			return err
-		}
-		if c, ok, err = r.cachedCommit(h); err != nil {
-			return err
-		} else if !ok {
-			return notFound("commit %s", h)
-		}
+		return nil, notFound("commit %s", h)
 	}
-	for attempt := 0; ; attempt++ {
-		var missing []object.Hash
-		done, err := r.missingTrees(c.Tree, &missing, map[object.Hash]bool{})
-		if err != nil {
-			return err
-		}
-		if done {
-			return nil
-		}
-		if attempt >= 3 {
-			return fmt.Errorf("gitq: server did not send %d tree(s) of commit %s", len(missing), h)
-		}
-		if err := r.fetchTrees(ctx, missing); err != nil {
-			return err
-		}
+	return parseCommit(h, o)
+}
+
+// fetch runs one fetch, decoding the pack as it streams in, and caches every
+// object in it.
+func (r *repo) fetch(ctx context.Context, req wire.FetchRequest) (map[object.Hash]object.Object, error) {
+	rc, err := r.wc.FetchStream(ctx, req, r.cfg.maxFetch)
+	if err != nil {
+		return nil, mapErr(err)
 	}
+	defer rc.Close()
+	objs, err := pack.DecodeLimited(rc, r.lookup, pack.Limits{MaxObject: r.cfg.maxFile, MaxTotal: r.cfg.maxFetch})
+	if err != nil {
+		return nil, mapErr(fmt.Errorf("gitq: fetching pack: %w", err))
+	}
+	r.addObjects(objs)
+	return objs, nil
 }
 
 // ---- ref resolution ----
@@ -420,8 +280,19 @@ func (r *repo) resolve(ctx context.Context, ref string) (object.Hash, error) {
 	}
 	h := v.(object.Hash)
 	if r.cfg.refTTL > 0 {
+		now := time.Now()
 		r.refMu.Lock()
-		r.refs[ref] = refEntry{hash: h, exp: time.Now().Add(r.cfg.refTTL)}
+		if len(r.refs) >= maxRefEntries {
+			for k, e := range r.refs {
+				if now.After(e.exp) {
+					delete(r.refs, k)
+				}
+			}
+			if len(r.refs) >= maxRefEntries {
+				clear(r.refs)
+			}
+		}
+		r.refs[ref] = refEntry{hash: h, exp: now.Add(r.cfg.refTTL)}
 		r.refMu.Unlock()
 	}
 	return h, nil

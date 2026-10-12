@@ -138,9 +138,6 @@ func (r *repo) save(ctx context.Context, branch, expectedSHA, message string, au
 		if err != nil {
 			return "", err
 		}
-		if err := r.ensureCommit(ctx, parent); err != nil {
-			return "", err
-		}
 		baseTree = c.Tree
 	}
 
@@ -186,9 +183,5 @@ func (r *repo) save(ctx context.Context, branch, expectedSHA, message string, au
 		m[o.Hash()] = o
 	}
 	r.addObjects(m)
-	var missing []object.Hash
-	if _, err := r.missingTrees(root, &missing, map[object.Hash]bool{}); err != nil {
-		return "", err
-	}
 	return ch.String(), nil
 }

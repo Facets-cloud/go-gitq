@@ -14,6 +14,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -26,6 +27,8 @@ var (
 	ErrUnsupported = errors.New("gitq: server does not support protocol v2 with filters")
 	// ErrAuth: credentials missing or rejected.
 	ErrAuth = errors.New("gitq: authentication failed")
+	// ErrTooLarge: the server sent more than MaxFileSize or MaxFetchSize allow.
+	ErrTooLarge = errors.New("gitq: response exceeds size limit")
 )
 
 // File is one file in a listing.
@@ -61,25 +64,72 @@ type Option func(*config)
 
 type config struct {
 	httpClient   *http.Client
-	auth         func(*http.Request)
+	auth         func(*http.Request) error
 	refTTL       time.Duration
 	historyDepth int
+	maxFile      int64
+	maxFetch     int64
 }
 
-// Token authenticates with a bearer-style access token (sent as HTTP basic auth
-// with user "x-access-token", which GitHub, GitLab and Gitea all accept).
+const (
+	defaultMaxFile  = 100 << 20 // GitHub's own hard limit per file
+	defaultMaxFetch = 512 << 20
+)
+
+// Token authenticates with an access token over HTTP basic auth, using the
+// username each host expects alongside a token: "x-token-auth" on bitbucket.org
+// (repository/workspace access tokens), "x-access-token" on github.com and
+// GitHub Enterprise Cloud (*.ghe.com), and "oauth2" elsewhere, which GitLab
+// (gitlab.com and self-hosted), Gitea and GitHub Enterprise Server accept.
+// Use BasicAuth to choose the username yourself (e.g. Bitbucket app passwords).
 func Token(token string) Option {
 	return func(c *config) {
-		c.auth = func(r *http.Request) { r.SetBasicAuth("x-access-token", token) }
+		c.auth = func(r *http.Request) error {
+			r.SetBasicAuth(tokenUser(r.URL.Hostname()), token)
+			return nil
+		}
+	}
+}
+
+func tokenUser(host string) string {
+	host = strings.ToLower(host)
+	switch {
+	case host == "bitbucket.org":
+		return "x-token-auth"
+	case host == "github.com" || strings.HasSuffix(host, ".ghe.com"):
+		return "x-access-token"
+	default:
+		return "oauth2"
 	}
 }
 
 // BasicAuth authenticates with a username and password or app password.
 func BasicAuth(user, password string) Option {
 	return func(c *config) {
-		c.auth = func(r *http.Request) { r.SetBasicAuth(user, password) }
+		c.auth = func(r *http.Request) error {
+			r.SetBasicAuth(user, password)
+			return nil
+		}
 	}
 }
+
+// AuthFunc sets a function called on every request to add credentials, for
+// tokens that rotate (GitHub App installation tokens, OAuth refresh): set the
+// Authorization header from the current token, e.g. with
+// req.SetBasicAuth("x-access-token", tok). req.Context() is the caller's
+// context. An error aborts the request and the call fails with ErrAuth.
+func AuthFunc(fn func(req *http.Request) error) Option {
+	return func(c *config) { c.auth = fn }
+}
+
+// MaxFileSize sets the largest file, tree or commit accepted from the server;
+// a larger one fails the call instead of being allocated. Default 100 MiB.
+func MaxFileSize(n int64) Option { return func(c *config) { c.maxFile = n } }
+
+// MaxFetchSize caps one fetch from the server: both the bytes received and the
+// memory its objects decode into. A larger response fails the call with
+// ErrTooLarge. Default 512 MiB. Up to 4 fetches run at once per call.
+func MaxFetchSize(n int64) Option { return func(c *config) { c.maxFetch = n } }
 
 // HTTPClient sets the http.Client used for every request.
 func HTTPClient(h *http.Client) Option { return func(c *config) { c.httpClient = h } }
@@ -92,33 +142,38 @@ func RefTTL(d time.Duration) Option { return func(c *config) { c.refTTL = d } }
 // when the history is not cached yet. Default 100.
 func HistoryDepth(n int) Option { return func(c *config) { c.historyDepth = n } }
 
-// Cache holds fetched file contents in memory, compressed, up to a fixed
-// budget; least recently used files are evicted first. Contents are keyed by
-// their git hash, so one Cache can and should be shared by every Repo in the
+// Cache holds everything fetched from servers (file contents, directory
+// listings, commits) in memory up to a fixed budget; least recently used
+// objects are evicted first, and are fetched again if needed. Objects are keyed
+// by their git hash, so one Cache can and should be shared by every Repo in the
 // process: the budget is then process-wide and identical files are stored once.
-type Cache struct{ blobs *blobLRU }
+//
+// A Repo keeps nothing outside its Cache except resolved refs (when RefTTL is
+// set), so the budget bounds memory at rest. Size it to hold at least the
+// directory listings of your largest repo at one commit (a few MB for
+// hashicorp/terraform), or reads will refetch them.
+type Cache struct{ objs *objLRU }
 
-// NewCache returns a cache that uses at most maxBytes of memory for file
-// contents; maxBytes 0 caches nothing. With compress, contents are stored
-// compressed (source code typically shrinks 3-5x, so the budget holds that many
-// more files) and each cache hit pays a decompression (roughly 20us per 10KB).
-// Without it, hits are near-free but the budget holds fewer files.
+// NewCache returns a cache that uses at most maxBytes of memory; maxBytes 0
+// caches nothing. With compress, file contents are stored compressed (source
+// code typically shrinks 3-5x, so the budget holds that many more files) and
+// each hit pays a decompression (roughly 20us per 10KB). Without it, hits are
+// near-free but the budget holds fewer files.
 func NewCache(maxBytes int64, compress bool) *Cache {
-	return &Cache{blobs: newBlobLRU(maxBytes, compress)}
+	return &Cache{objs: newObjLRU(maxBytes, compress)}
 }
 
 // CacheStats describes what a Cache holds.
 type CacheStats struct {
 	Files       int   // cached file contents
-	StoredBytes int64 // memory they use (compressed, if enabled)
-	FileBytes   int64 // their uncompressed size
+	Trees       int   // cached directory listings
+	Commits     int   // cached commits
+	StoredBytes int64 // memory used by all of them (files compressed, if enabled)
+	FileBytes   int64 // uncompressed size of the cached file contents
 }
 
 // Stats reports the current cache contents.
-func (c *Cache) Stats() CacheStats {
-	n, stored, raw := c.blobs.stats()
-	return CacheStats{Files: n, StoredBytes: stored, FileBytes: raw}
-}
+func (c *Cache) Stats() CacheStats { return c.objs.stats() }
 
 // Repo is a handle to one remote repository. It is safe for concurrent use.
 type Repo struct {
@@ -132,11 +187,11 @@ func Open(ctx context.Context, url string, cache *Cache, opts ...Option) (*Repo,
 	if cache == nil {
 		return nil, errors.New("gitq: Open needs a cache; create one with gitq.NewCache and share it")
 	}
-	cfg := config{historyDepth: 100}
+	cfg := config{historyDepth: 100, maxFile: defaultMaxFile, maxFetch: defaultMaxFetch}
 	for _, o := range opts {
 		o(&cfg)
 	}
-	r, err := open(ctx, url, cfg, cache.blobs)
+	r, err := open(ctx, url, cfg, cache.objs)
 	if err != nil {
 		return nil, err
 	}
@@ -171,7 +226,10 @@ func (r *Repo) ListFiles(ctx context.Context, ref, dir string) ([]File, error) {
 }
 
 // GetHistory returns up to limit commits reachable from ref that changed path
-// (a file or directory), newest first, following first parents.
+// (a file or directory, "" for any change), newest first: the same commits, in
+// the same order, as `git log -n limit ref -- path`. Like git, it follows a
+// merge into the parent the path came from unchanged, and lists a merge only
+// when it differs from every parent.
 func (r *Repo) GetHistory(ctx context.Context, ref, path string, limit int) ([]Commit, error) {
 	return r.r.getHistory(ctx, ref, path, limit)
 }
