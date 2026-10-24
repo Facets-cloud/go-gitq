@@ -50,10 +50,11 @@ file's content changes, so callers can skip unchanged files cheaply.
 - Auth: `gitq.Token(tok)`, `gitq.BasicAuth(user, pass)`, or
   `gitq.AuthFunc(func(*http.Request) error)`, called on every request, for
   tokens that rotate (GitHub App installation tokens).
-- Memory: `gitq.MaxFileSize(n)` (default 100 MiB) and `gitq.MaxFetchSize(n)`
-  (default 512 MiB) bound what a server can make gitq allocate. Packs are
-  decoded as they stream in; sizes are checked before allocating, and exceeding
-  a limit fails with `ErrTooLarge`.
+- Memory: `gitq.MaxFileSize(n)` (default 100 MiB), `gitq.MaxFetchSize(n)`
+  (default 512 MiB) and `gitq.MaxRefsSize(n)` (default 16 MiB, for the
+  capability advertisement, ls-refs answers and push responses) bound what a
+  server can make gitq allocate. Packs are decoded as they stream in; sizes are
+  checked before allocating, and exceeding a limit fails with `ErrTooLarge`.
 - Go 1.24 or later.
 - Not supported: SSH, LFS content, submodule contents, merges, signed commits.
 

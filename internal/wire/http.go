@@ -66,6 +66,44 @@ func isRateLimited(resp *http.Response) bool {
 		h.Get("RateLimit-Remaining") == "0"
 }
 
+// limitBody caps how much of resp's body can be read, the parser and
+// closeBody's drain together: past limit bytes (0 = no limit) a read fails
+// with ErrTooLarge naming what was being read, and nothing more is taken from
+// the connection. A body of exactly limit bytes still reads to EOF.
+func limitBody(resp *http.Response, limit int64, what string) {
+	if limit > 0 {
+		resp.Body = &limitedBody{ReadCloser: resp.Body, limit: limit, left: limit, what: what}
+	}
+}
+
+type limitedBody struct {
+	io.ReadCloser
+	limit, left int64
+	what        string
+	err         error
+}
+
+func (b *limitedBody) Read(p []byte) (int, error) {
+	if b.err != nil {
+		return 0, b.err
+	}
+	if b.left == 0 {
+		// At the limit: one more byte means the body is too large.
+		var one [1]byte
+		if _, err := io.ReadFull(b.ReadCloser, one[:]); err != nil {
+			return 0, err
+		}
+		b.err = fmt.Errorf("%w: %s larger than %d bytes", ErrTooLarge, b.what, b.limit)
+		return 0, b.err
+	}
+	if int64(len(p)) > b.left {
+		p = p[:b.left]
+	}
+	n, err := b.ReadCloser.Read(p)
+	b.left -= int64(n)
+	return n, err
+}
+
 // closeBody drains (bounded) and closes so the connection can be reused.
 func closeBody(resp *http.Response) {
 	io.Copy(io.Discard, io.LimitReader(resp.Body, 256<<10))

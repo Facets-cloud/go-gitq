@@ -21,6 +21,7 @@ func (c *Client) receivePackAdvert(ctx context.Context) (*receiveAdvert, error) 
 	if err != nil {
 		return nil, err
 	}
+	limitBody(resp, c.MaxRefsSize, "receive-pack advertisement")
 	defer closeBody(resp)
 	adv := &receiveAdvert{refs: map[string]object.Hash{}, caps: map[string]string{}}
 	pr := newPktReader(resp.Body)
@@ -31,8 +32,10 @@ func (c *Client) receivePackAdvert(ctx context.Context) (*receiveAdvert, error) 
 			return nil, unexpected(err)
 		}
 		if first && k == pktData && strings.HasPrefix(line, "# service=") {
-			if k, _, err := pr.nextLine(); err != nil || k != pktFlush {
-				return nil, fmt.Errorf("wire: malformed receive-pack preamble: %v", err)
+			if k, _, err := pr.nextLine(); err != nil {
+				return nil, unexpected(err)
+			} else if k != pktFlush {
+				return nil, fmt.Errorf("wire: malformed receive-pack preamble")
 			}
 			continue
 		}
@@ -122,6 +125,7 @@ func (c *Client) push(ctx context.Context, updates []RefUpdate, pack []byte) err
 	if err != nil {
 		return err
 	}
+	limitBody(resp, c.MaxRefsSize, "push report")
 	defer closeBody(resp)
 
 	var report *pktReader
