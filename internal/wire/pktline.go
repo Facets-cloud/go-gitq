@@ -11,6 +11,7 @@ import (
 	"github.com/facets-cloud/go-gitq/internal/object"
 )
 
+// maxPktLen is the longest pkt-line the protocol allows, header included.
 const maxPktLen = 65520
 
 type pktKind int
@@ -68,12 +69,14 @@ func (p *pktReader) next() (pktKind, []byte, error) {
 	case 3:
 		return 0, nil, fmt.Errorf("wire: bad pkt-line length 3")
 	}
-	l -= 4
-	if l > len(p.buf) {
-		p.buf = make([]byte, l)
+	if l > maxPktLen {
+		return 0, nil, fmt.Errorf("wire: pkt-line length %d exceeds the protocol maximum %d", l, maxPktLen)
 	}
-	b := p.buf[:l]
+	b := p.buf[:l-4]
 	if _, err := io.ReadFull(p.r, b); err != nil {
+		if errors.Is(err, ErrTooLarge) {
+			return 0, nil, err
+		}
 		return 0, nil, fmt.Errorf("wire: truncated pkt-line: %w", unexpected(err))
 	}
 	return pktData, b, nil

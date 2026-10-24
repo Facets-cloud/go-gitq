@@ -16,6 +16,7 @@ func (c *Client) capabilities(ctx context.Context) (Caps, error) {
 	if err != nil {
 		return Caps{}, err
 	}
+	limitBody(resp, c.MaxRefsSize, "capability advertisement")
 	defer closeBody(resp)
 	var caps Caps
 	pr := newPktReader(resp.Body)
@@ -35,8 +36,10 @@ func (c *Client) capabilities(ctx context.Context) (Caps, error) {
 			first = false
 			if k == pktData && strings.HasPrefix(line, "# service=") {
 				// Smart-HTTP preamble: service line followed by a flush.
-				if k, _, err := pr.nextLine(); err != nil || k != pktFlush {
-					return caps, fmt.Errorf("wire: malformed service preamble: %v", err)
+				if k, _, err := pr.nextLine(); err != nil {
+					return caps, unexpected(err)
+				} else if k != pktFlush {
+					return caps, fmt.Errorf("wire: malformed service preamble")
 				}
 				if k, line, err = pr.nextLine(); err != nil {
 					return caps, unexpected(err)
@@ -72,6 +75,7 @@ func (c *Client) lsRefs(ctx context.Context, prefixes []string) ([]Ref, error) {
 	if err != nil {
 		return nil, err
 	}
+	limitBody(resp, c.MaxRefsSize, "ls-refs response")
 	defer closeBody(resp)
 	pr := newPktReader(resp.Body)
 	var refs []Ref
@@ -134,6 +138,7 @@ func (c *Client) fetchStream(ctx context.Context, req FetchRequest, maxBytes int
 	if err != nil {
 		return nil, err
 	}
+	limitBody(resp, fetchBodyLimit(maxBytes), "fetch response")
 	pr := newPktReader(resp.Body)
 
 	// Section headers, skipping everything until "packfile".
@@ -160,6 +165,19 @@ func (c *Client) fetchStream(ctx context.Context, req FetchRequest, maxBytes int
 			return nil, fmt.Errorf("wire: unexpected fetch section %q", line)
 		}
 	}
+}
+
+// fetchBodyLimit caps a whole fetch response for a pack limit of maxPack, so
+// endless section lines or progress messages cannot stream forever. It allows
+// the pack, its pkt-line framing with room to spare (5 bytes a packet; git
+// sends up to 8 KiB a packet, under maxPack/1600, and maxPack/64 is allowed)
+// and 1 MiB for section lines such as shallow-info. A well-formed response
+// over maxPack still fails first on the exact pack limit in sidebandReader.
+func fetchBodyLimit(maxPack int64) int64 {
+	if maxPack <= 0 {
+		return 0
+	}
+	return maxPack + maxPack/64 + 1<<20
 }
 
 // skipSection discards lines until a delim. A flush means the response ended.

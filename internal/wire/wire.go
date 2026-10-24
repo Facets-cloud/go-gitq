@@ -31,11 +31,14 @@ func (e *RejectedError) Error() string {
 
 // Client talks to one repository. URL is the https repository URL ending in
 // ".git" (the caller normalises it). Auth, if set, is called on every request
-// to add credentials; an error from it aborts that request.
+// to add credentials; an error from it aborts that request. MaxRefsSize, if
+// > 0, caps the bytes read from each capability or ref advertisement, ls-refs
+// answer and push report; a larger one fails with ErrTooLarge.
 type Client struct {
-	URL  string
-	HTTP *http.Client
-	Auth func(*http.Request) error
+	URL         string
+	HTTP        *http.Client
+	Auth        func(*http.Request) error
+	MaxRefsSize int64
 }
 
 func NewClient(url string, httpc *http.Client, auth func(*http.Request) error) *Client {

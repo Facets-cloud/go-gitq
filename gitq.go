@@ -27,7 +27,8 @@ var (
 	ErrUnsupported = errors.New("gitq: server does not support protocol v2 with filters")
 	// ErrAuth: credentials missing or rejected.
 	ErrAuth = errors.New("gitq: authentication failed")
-	// ErrTooLarge: the server sent more than MaxFileSize or MaxFetchSize allow.
+	// ErrTooLarge: the server sent more than MaxFileSize, MaxFetchSize or
+	// MaxRefsSize allow.
 	ErrTooLarge = errors.New("gitq: response exceeds size limit")
 )
 
@@ -69,11 +70,13 @@ type config struct {
 	historyDepth int
 	maxFile      int64
 	maxFetch     int64
+	maxRefs      int64
 }
 
 const (
 	defaultMaxFile  = 100 << 20 // GitHub's own hard limit per file
 	defaultMaxFetch = 512 << 20
+	defaultMaxRefs  = 16 << 20 // ~2x the ls-refs answer of a repository with 100k refs
 )
 
 // Token authenticates with an access token over HTTP basic auth, using the
@@ -131,6 +134,18 @@ func MaxFileSize(n int64) Option { return func(c *config) { c.maxFile = n } }
 // ErrTooLarge. Default 512 MiB. Up to 4 fetches run at once per call.
 func MaxFetchSize(n int64) Option { return func(c *config) { c.maxFetch = n } }
 
+// MaxRefsSize caps the bytes read from each response that lists refs or
+// capabilities: the capability advertisement Open reads, every ls-refs answer
+// (GetSHA, ListBranches and each branch or tag lookup), and Save's receive-pack
+// advertisement and push report. A larger response fails the call with
+// ErrTooLarge, and gitq stops reading at the cap. Default 16 MiB: a repository
+// with 100k refs answers in 8-10 MiB, a capability advertisement is under
+// 1 KiB, and a branch or tag lookup lists only the refs it matches, so only a
+// broken or hostile server gets near it. A response at the cap can briefly
+// take about 4x its size in heap (up to ~14x for a hostile stream of minimal
+// lines), so set it lower under a tight memory limit. n <= 0 removes the cap.
+func MaxRefsSize(n int64) Option { return func(c *config) { c.maxRefs = n } }
+
 // HTTPClient sets the http.Client used for every request.
 func HTTPClient(h *http.Client) Option { return func(c *config) { c.httpClient = h } }
 
@@ -187,7 +202,7 @@ func Open(ctx context.Context, url string, cache *Cache, opts ...Option) (*Repo,
 	if cache == nil {
 		return nil, errors.New("gitq: Open needs a cache; create one with gitq.NewCache and share it")
 	}
-	cfg := config{historyDepth: 100, maxFile: defaultMaxFile, maxFetch: defaultMaxFetch}
+	cfg := config{historyDepth: 100, maxFile: defaultMaxFile, maxFetch: defaultMaxFetch, maxRefs: defaultMaxRefs}
 	for _, o := range opts {
 		o(&cfg)
 	}

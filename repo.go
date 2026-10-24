@@ -55,6 +55,7 @@ func open(ctx context.Context, url string, cfg config, objs *objLRU) (*repo, err
 		objs: objs,
 		refs: make(map[string]refEntry),
 	}
+	r.wc.MaxRefsSize = cfg.maxRefs
 	caps, err := r.wc.Capabilities(ctx)
 	if err != nil {
 		return nil, mapErr(err)
